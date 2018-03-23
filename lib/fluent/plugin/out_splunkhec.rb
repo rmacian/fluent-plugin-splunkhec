@@ -27,7 +27,7 @@ module Fluent
     def configure(conf)
       super
       @splunk_url = @protocol + '://' + @host + ':' + @port + '/services/collector/event'
-      log.debug 'splunkhec: sent data to ' + @splunk_url
+      log.debug 'splunkhec: sending data to ' + @splunk_url
 
       if conf['event_host'] == nil
         begin
@@ -52,10 +52,52 @@ module Fluent
       [tag, time, record].to_msgpack
     end
 
+    def expand_param(param, tag, time, record)
+      # check for '${ ... }'
+      #   yes => `eval`
+      #   no  => return param
+      return param if (param =~ /\${.+}/).nil?
+
+      # check for 'tag_parts[]'
+      # separated by a delimiter (default '.')
+      tag_parts = tag.split(@delimiter) unless (param =~ /tag_parts\[.+\]/).nil? || tag.nil?
+
+      # pull out section between ${} then eval
+      inner = param.clone
+      while inner.match(/\${.+}/)
+        to_eval = inner.match(/\${(.+?)}/){$1}
+
+        if !(to_eval =~ /record\[.+\]/).nil? && record.nil?
+          return to_eval
+        elsif !(to_eval =~/tag_parts\[.+\]/).nil? && tag_parts.nil?
+          return to_eval
+        elsif !(to_eval =~/time/).nil? && time.nil?
+          return to_eval
+        else
+          inner.sub!(/\${.+?}/, eval( to_eval ))
+        end
+      end
+      inner
+    end
+
     # Loop through all records and sent them to Splunk
     def write(chunk)
       body = ''
       chunk.msgpack_each {|(tag,time,record)|
+
+        # define index and sourcetype dynamically
+        begin
+          index = expand_param(@index, tag, time, record)
+          sourcetype = expand_param(@sourcetype, tag, time, record)
+          event_host = expand_param(@event_host, tag, time, record)
+          token = expand_param(@token, tag, time, record)
+        rescue => e
+          # handle dynamic parameters misconfigurations
+          router.emit_error_event(tag, time, record, e)
+          next
+        end
+        log.debug "routing event from #{event_host} to #{index} index"
+        log.debug "expanded token #{token}"
         # Parse record to Splunk event format
         case record
         when Fixnum
@@ -70,43 +112,40 @@ module Fluent
           event = record
         end
 
-        sourcetype = @sourcetype == 'tag' ? tag : @sourcetype
-
         # Build body for the POST request
         if !@usejson
           event = record["time"]+ " " + record["message"].to_json.gsub(/^"|"$/,"")
-          body << '{"time":"'+ DateTime.parse(record["time"]).strftime("%Q") +'", "event":"' + event + '", "sourcetype" :"' + sourcetype + '", "source" :"' + @source + '", "index" :"' + @index + '", "host" : "' + @event_host + '"}'
+          body << '{"time":"'+ DateTime.parse(record["time"]).strftime("%Q") +'", "event":"' + event + '", "sourcetype" :"' + sourcetype + '", "source" :"' + @source + '", "index" :"' + index + '", "host" : "' + event_host + '"}'
         elsif @send_event_as_json
-          body << '{"time" :' + time.to_s + ', "event" :' + event + ', "sourcetype" :"' + sourcetype + '", "source" :"' + @source + '", "index" :"' + @index + '", "host" : "' + @event_host + '"}'
+          body << '{"time" :' + time.to_s + ', "event" :' + event + ', "sourcetype" :"' + sourcetype + '", "source" :"' + @source + '", "index" :"' + index + '", "host" : "' + event_host + '"}'
         else
-          body << '{"time" :' + time.to_s + ', "event" :"' + event + '", "sourcetype" :"' + sourcetype + '", "source" :"' + @source + '", "index" :"' + @index + '", "host" : "' + @event_host + '"}'
+          body << '{"time" :' + time.to_s + ', "event" :"' + event + '", "sourcetype" :"' + sourcetype + '", "source" :"' + @source + '", "index" :"' + index + '", "host" : "' + event_host + '"}'
         end
 
         if @send_batched_events
           body << "\n"
         else
-          send_to_splunk(body)
+          send_to_splunk(body,token)
           body = ''
         end
       }
 
       if @send_batched_events
-        send_to_splunk(body)
+        send_to_splunk(body,token)
       end
     end
 
-    def send_to_splunk(body)
-      log.debug "splunkhec: " + body + "\n"
-
+    def send_to_splunk(body,token)
       uri = URI(@splunk_url)
 
       # Create client
       http = Net::HTTP.new(uri.host, uri.port)
+      http.set_debug_output(log.debug)
 
       # Create Request
       req = Net::HTTP::Post.new(uri)
       # Add headers
-      req.add_field "Authorization", "Splunk #{@token}"
+      req.add_field "Authorization", "Splunk #{token}"
       # Add headers
       req.add_field "Content-Type", "application/json; charset=utf-8"
       # Set body
@@ -119,6 +158,8 @@ module Fluent
 
       # Fetch Request
       res = http.request(req)
+      log.debug "token in req: #{token}"
+      log.debug "body: #{req.body}"
       log.debug "splunkhec: response HTTP Status Code is #{res.code}"
       if res.code.to_i != 200
         body = JSON.parse(res.body)
